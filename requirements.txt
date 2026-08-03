@@ -1,0 +1,5 @@
+ccxt
+python-dotenv
+loguru
+requests
+redis
