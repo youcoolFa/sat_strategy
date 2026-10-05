@@ -95,6 +95,6 @@ class TickerFeed:
                 self._last_price = price
 
 
-# 全域共用的 instance，跟 notifier.py 的 `notifier` 同一種用法：
+# 全域共用的 instance，跟 log/logger_setup.py 的 get_notifier() 同一種用意：
 # bot.py 直接 import 這個 instance 使用，不用自己管生命週期。
 ticker_feed = TickerFeed()

@@ -245,3 +245,62 @@ class TestRunRetryLogic:
 
             mock_exit.assert_not_called()
             mock_cleanup.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Telegram 事件訊息:哪些 log 會發到手機(telegram=True 的 INFO + WARNING 以上)
+# ---------------------------------------------------------------------------
+class TestTelegramEvents:
+    def _run_one_cycle(self, dry_run):
+        """跑一輪:進場成交 → 平倉成交 → 收到停止訊號 → 清理。回傳會發到 Telegram 的訊息。"""
+        from loguru import logger
+
+        from app.log.telegram_notifier import telegram_filter
+
+        bot = make_bot(dry_run=dry_run, testnet=False)
+        sent = []
+        sink = logger.add(lambda m: sent.append(m.record), level="DEBUG", filter=telegram_filter)
+        try:
+            with patch.object(bot, "_get_last_price", return_value=85283.10), \
+                 patch.object(bot, "_window_end", return_value=datetime.now(HKT) + timedelta(hours=1)), \
+                 patch.object(bot, "_place_entry_order", return_value={"id": "e1"}), \
+                 patch.object(bot, "_place_exit_order", return_value={"id": "x1"}), \
+                 patch.object(bot, "_cleanup"):
+
+                def fake_wait(order, window_end):
+                    if order["id"] == "x1":
+                        bot._stop_requested = True
+                    return 0.001
+
+                with patch.object(bot, "_wait_until_filled_or_stop", side_effect=fake_wait):
+                    bot.run()
+        finally:
+            logger.remove(sink)
+        return [r["message"] for r in sent]
+
+    def test_live_run_sends_start_fills_and_end(self):
+        msgs = self._run_one_cycle(dry_run=False)
+        assert len(msgs) == 4, msgs
+        start, bought, closed, end = msgs
+        assert "啟動" in start and "實盤" in start and "85283.10" in start and "84643.48" in start
+        assert "買入成交" in bought
+        assert "平倉成交" in closed and "+0.64" in closed  # (85283.10 − 84643.48) × 0.001
+        assert "結束" in end and "完成 1 輪" in end
+
+    def test_dry_run_only_sends_start_and_end(self):
+        msgs = self._run_one_cycle(dry_run=True)
+        assert len(msgs) == 2, msgs
+        assert "DRY RUN" in msgs[0] and "結束" in msgs[1]
+
+    def test_mode_banners_are_not_sent_separately(self):
+        from loguru import logger
+
+        from app.log.telegram_notifier import telegram_filter
+
+        sent = []
+        sink = logger.add(lambda m: sent.append(m.record), level="DEBUG", filter=telegram_filter)
+        try:
+            make_bot(dry_run=True, testnet=False)
+        finally:
+            logger.remove(sink)
+        assert sent == []  # DRY RUN / 正式環境 橫幅不另外發,已包含在啟動訊息裡

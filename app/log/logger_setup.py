@@ -4,7 +4,8 @@ app/log/logger_setup.py
 參考 /Users/mac/fa_trade/Fa_Successful_trade/app/log/logger_setup.py 的結構改的:
     - console sink (INFO 以上,彩色)
     - rotating file sink (logs/sat_strategy.log,DEBUG 以上,含 backtrace/diagnose)
-    - telegram sink (WARNING 以上,真的發送,不是 mock;斷線重連邏輯在 notifier.py)
+    - telegram sink (WARNING 以上 + 標記 telegram=True 的重要事件;背景發送、冷卻時間、
+      不會自己觸發自己,見 telegram_notifier.py——跟 Fa_Successful_trade 同一套)
 
 使用方式:
     from app.log.logger_setup import setup_logger
@@ -15,20 +16,43 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, cast
+from typing import Any, Optional, cast
 
 from loguru import logger
 from loguru._logger import Logger
 
-from app.notifier import notifier
+from app.log.log_limit import enforce_log_limit, max_total_mb_from_env, size_retention
+from app.log.telegram_notifier import TelegramNotifier, telegram_filter
 
-_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "logs")
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_LOG_DIR = os.path.join(_PROJECT_ROOT, "logs")
+
+# log 總大小上限(MB),超過就從最舊的檔刪起,見 log_limit.py;可用 .env 的 LOG_MAX_TOTAL_MB 調整。
+# 分兩組各自計算:logs/sat_strategy*.log(loguru 寫的),以及專案根目錄每次啟動一個的
+# sat_strategy_<時間>.log(sat_strategy_start.sh 把終端機輸出導進去的)。
+# logs/ 裡 launchd_*.log(排程啟動/停止紀錄)不在範圍內,不會被刪。
+DEFAULT_LOG_MAX_TOTAL_MB = 300
+
+# 每個 log 檔寫到這個大小就封存(輪替),封存的檔壓縮成 .log.gz(純文字約剩 1/10)。
+# 正在寫的 sat_strategy.log 不壓縮。根目錄的 sat_strategy_<時間>.log 是 shell 導向的
+# 終端機輸出,不經過 loguru,不會被壓縮(大小限制器照樣管)。
+LOG_ROTATION = "10 MB"
+LOG_COMPRESSION = "gz"
 
 
-def _telegram_sink(message: Any) -> None:
-    record = message.record
-    text = f"[sat_strategy] {record['level'].name} | {record['message']}"
-    notifier.send(text)
+# Telegram 訊息標題用的名稱(對應 @sat_strategy_bot)
+TELEGRAM_PROJECT = "sat_strategy"
+
+_notifier: Optional[TelegramNotifier] = None
+
+
+def get_notifier() -> TelegramNotifier:
+    """全程式共用一個發送器(冷卻時間、連線狀態才會一致)。第一次用到才建立,
+    這時 .env 已經載入;沒有 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID 就是停用狀態。"""
+    global _notifier
+    if _notifier is None:
+        _notifier = TelegramNotifier(project=TELEGRAM_PROJECT)
+    return _notifier
 
 
 def setup_logger(quiet: bool = False) -> Logger:
@@ -58,12 +82,17 @@ def setup_logger(quiet: bool = False) -> Logger:
     )
 
     os.makedirs(_LOG_DIR, exist_ok=True)
+    log_file = os.path.join(_LOG_DIR, "sat_strategy.log")
+    max_total_mb = max_total_mb_from_env(DEFAULT_LOG_MAX_TOTAL_MB)
+    enforce_log_limit(_LOG_DIR, max_total_mb, pattern="sat_strategy*.log*", protect=[log_file])
+    enforce_log_limit(_PROJECT_ROOT, max_total_mb, pattern="sat_strategy_*.log")  # 正在寫的是剛建立的 → 不會刪
 
     logger.add(
-        os.path.join(_LOG_DIR, "sat_strategy.log"),
+        log_file,
         level=file_level,
-        rotation="10 MB",
-        retention="14 days",
+        rotation=LOG_ROTATION,
+        compression=LOG_COMPRESSION,
+        retention=size_retention(_LOG_DIR, max_total_mb, pattern="sat_strategy*.log*", protect=[log_file]),
         backtrace=True,
         diagnose=True,
         format=(
@@ -72,9 +101,12 @@ def setup_logger(quiet: bool = False) -> Logger:
         ),
     )
 
+    # Telegram:WARNING 以上(出問題)才發;重要事件用 logger.bind(telegram=True).info(...)
+    # 也會發;不想發的 WARNING 用 logger.bind(telegram=False)。quiet 模式不影響這裡。
     logger.add(
-        _telegram_sink,
-        level="WARNING",
+        get_notifier().sink,
+        level="INFO",
+        filter=telegram_filter,
     )
 
     return logger

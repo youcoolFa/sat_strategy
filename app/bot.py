@@ -62,7 +62,7 @@ class SatStrategyBot:
     # ------------------------------------------------------------------
     def _build_exchange(self):
         if self.config.dry_run:
-            logger.warning("=== DRY RUN 模式:不會真的下單,只會記錄 log ===")
+            logger.bind(telegram=False).warning("=== DRY RUN 模式:不會真的下單,只會記錄 log ===")
         exchange = ccxt.bybit({
             "apiKey": os.getenv("BYBIT_API_KEY", ""),
             "secret": os.getenv("BYBIT_API_SECRET", ""),
@@ -71,9 +71,9 @@ class SatStrategyBot:
         })
         if self.config.testnet:
             exchange.set_sandbox_mode(True)
-            logger.warning("=== 使用 Bybit 測試網 (testnet) ===")
+            logger.bind(telegram=False).warning("=== 使用 Bybit 測試網 (testnet) ===")
         else:
-            logger.warning("=== 使用 Bybit 正式環境,將動用真實資金! ===")
+            logger.bind(telegram=False).warning("=== 使用 Bybit 正式環境,將動用真實資金! ===")
         return exchange
 
     def _handle_stop_signal(self, signum, frame):
@@ -173,7 +173,7 @@ class SatStrategyBot:
         return 0.0
 
     def _cleanup(self):
-        logger.warning("開始清理:取消所有未成交掛單,市價平掉未平倉部位")
+        logger.bind(telegram=False).warning("開始清理:取消所有未成交掛單,市價平掉未平倉部位")
         # 這是最後一道防線,絕對不能因為網路暫時失敗就放棄——寧可整段清理流程
         # 重來(冪等:重查一次未成交掛單/持倉,不會重複下單),也不要留下沒人管的
         # 真實掛單或部位。
@@ -247,19 +247,36 @@ class SatStrategyBot:
         now = self._now_hkt()
         window_end = self._window_end(now)
         if self.config.test_window_minutes is not None:
-            logger.warning(
+            logger.bind(telegram=False).warning(
                 f"=== 使用臨時測試時間窗 ({self.config.test_window_minutes} 分鐘後結束),"
                 f"不是正式週末排程 ==="
             )
         elif self.config.manual_stop_only:
-            logger.warning(
+            logger.bind(telegram=False).warning(
                 "=== 手動啟停模式,沒有自動結束時間,只能手動 Ctrl+C 或 kill 停止 ==="
             )
         logger.info(f"啟動 sat_strategy bot,窗口結束時間: {window_end}")
 
+        if self.config.cleanup_on_start:
+            logger.warning("=== 崩潰後重啟:先清理上一個 process 留下的掛單/部位,再重新開始 ===")
+            self._cleanup()
+
         origin_price = self._get_last_price()
         logger.info(f"起點價格 (origin_price) = {origin_price:.2f}")
         entry_price = compute_entry_price(origin_price, self.config.entry_deviation_pct)
+
+        # Telegram 事件:啟動/結束一律發;每一輪的成交只在實盤發(dry-run 每 5 秒就一輪,會洗版)
+        events = logger.bind(telegram=True)
+        trade_events = logger.bind(telegram=not self.config.dry_run)
+        qty = self.config.order_qty
+        events.info(
+            f"🚀 sat_strategy 啟動({self._mode_label()})\n"
+            f"{self.config.symbol}|窗口結束 {window_end:%Y-%m-%d %H:%M} HKT\n"
+            f"origin {origin_price:.2f} → 買入 {entry_price:.2f}(−{self.config.entry_deviation_pct}%)× {qty}\n"
+            f"平倉回到 origin {origin_price:.2f}"
+        )
+        cycles = 0
+        gross_total = 0.0
 
         while not self._stop_requested and not self._should_stop_for_cleanup(window_end):
             entry_order = self._place_entry_order(entry_price)
@@ -274,6 +291,7 @@ class SatStrategyBot:
                 continue
 
             logger.info(f"買入盤已成交,qty={filled_qty:.4f}")
+            trade_events.info(f"✅ 買入成交 {filled_qty} @ {entry_price:.2f},已掛平倉單 @ {origin_price:.2f}")
 
             # 已經買到手了,不管平倉單發生什麼事都不能回頭去補新的進場單——
             # 會在還沒平掉舊部位前又疊加一筆新部位。平倉單被取消就重掛一張新的
@@ -283,6 +301,13 @@ class SatStrategyBot:
                 exit_filled = self._wait_until_filled_or_stop(exit_order, window_end)
                 if exit_filled is not None:
                     logger.info("平倉盤已成交,這次交易完成,準備補回新的買入盤")
+                    cycles += 1
+                    gross = (origin_price - entry_price) * filled_qty
+                    gross_total += gross
+                    trade_events.info(
+                        f"💰 平倉成交 {filled_qty} @ {origin_price:.2f},第 {cycles} 輪完成,"
+                        f"毛利 {gross:+.2f} USDT(未扣手續費);補回買單 @ {entry_price:.2f}"
+                    )
                     break
                 if self._stop_requested or self._should_stop_for_cleanup(window_end):
                     break  # 平倉盤還沒成交就到清理時間了,交給 _cleanup 處理
@@ -292,6 +317,21 @@ class SatStrategyBot:
         if self.config.use_live_ticker_feed:
             ticker_feed.stop()
         logger.info("sat_strategy bot 結束")
+        reason = "收到停止訊號" if self._stop_requested else "窗口到期"
+        events.info(
+            f"🏁 sat_strategy 結束({reason})\n完成 {cycles} 輪,毛利合計 {gross_total:+.2f} USDT(未扣手續費)"
+        )
+
+    def _mode_label(self):
+        if self.config.dry_run:
+            mode = "DRY RUN,不會真的下單"
+        elif self.config.testnet:
+            mode = "測試網"
+        else:
+            mode = "實盤"
+        if self.config.test_window_minutes is not None:
+            mode += f",測試窗口 {self.config.test_window_minutes} 分鐘"
+        return mode
 
     def _wait_until_filled_or_stop(self, order, window_end):
         """輪詢訂單狀態,直到成交、或收到停止訊號、或進入清理時間。
@@ -329,7 +369,7 @@ def main():
     config = load_config()
     if config.test_window_minutes is not None:
         setup_logger(quiet=True)
-        logger.warning("=== 臨時測試窗口模式,log 等級調高到 WARNING,避免 dry-run 密集循環洗版 ===")
+        logger.bind(telegram=False).warning("=== 臨時測試窗口模式,log 等級調高到 WARNING,避免 dry-run 密集循環洗版 ===")
     logger.info(f"載入參數: {config.to_dict()}")
     bot = SatStrategyBot(config)
     bot.run()
