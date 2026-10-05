@@ -304,3 +304,94 @@ class TestTelegramEvents:
         finally:
             logger.remove(sink)
         assert sent == []  # DRY RUN / 正式環境 橫幅不另外發,已包含在啟動訊息裡
+
+
+class TestTelegramCategories:
+    def test_live_run_message_categories(self):
+        from loguru import logger
+
+        from app.log.telegram_notifier import telegram_filter
+
+        bot = make_bot(dry_run=False, testnet=False)
+        sent = []
+        sink = logger.add(lambda m: sent.append(m.record["extra"].get("category")), level="DEBUG", filter=telegram_filter)
+        try:
+            with patch.object(bot, "_get_last_price", return_value=85283.10), \
+                 patch.object(bot, "_window_end", return_value=datetime.now(HKT) + timedelta(hours=1)), \
+                 patch.object(bot, "_place_entry_order", return_value={"id": "e1"}), \
+                 patch.object(bot, "_place_exit_order", return_value={"id": "x1"}), \
+                 patch.object(bot, "_cleanup"):
+
+                def fake_wait(order, window_end):
+                    if order["id"] == "x1":
+                        bot._stop_requested = True
+                    return 0.001
+
+                with patch.object(bot, "_wait_until_filled_or_stop", side_effect=fake_wait):
+                    bot.run()
+        finally:
+            logger.remove(sink)
+        assert sent == [None, "fill", "fill", "pnl"]  # 啟動(系統)、買入、平倉、結束
+
+
+# ---------------------------------------------------------------------------
+# 每小時狀態回報(心跳,⚪ #狀態):收到 = 還活著
+# ---------------------------------------------------------------------------
+class TestStatusReport:
+    def _bot_in_progress(self, phase, cycles=0, gross=0.0):
+        bot = make_bot(dry_run=False, testnet=False)
+        start = datetime(2026, 10, 10, 4, 0, tzinfo=HKT)
+        bot._status_interval = 60
+        bot._started_at = start
+        bot._next_status = start + timedelta(minutes=60)
+        bot._status = {"origin": 85283.10, "entry_price": 84643.48, "qty": 0.001, "phase": phase,
+                       "cycles": cycles, "gross_total": gross,
+                       "window_end": datetime(2026, 10, 12, 6, 0, tzinfo=HKT)}
+        return bot, start
+
+    def _report(self, bot, at, price=85000.0):
+        from loguru import logger
+
+        from app.log.telegram_notifier import telegram_filter
+
+        sent = []
+        sink = logger.add(lambda m: sent.append(m.record), level="DEBUG", filter=telegram_filter)
+        try:
+            with patch.object(bot, "_now_hkt", return_value=at), patch.object(bot, "_get_last_price", return_value=price):
+                bot._maybe_report_status()
+        finally:
+            logger.remove(sink)
+        return sent
+
+    def test_waiting_for_entry(self):
+        bot, start = self._bot_in_progress("entry")
+        [r] = self._report(bot, start + timedelta(minutes=60))
+        msg = r["message"]
+        assert r["extra"]["category"] == "status"
+        assert "運作中(實盤)" in msg and "已運行 1 小時 0 分" in msg
+        assert "掛買單等待成交 @ 84643.48" in msg and "距現價 -0.42%" in msg
+        assert "已完成 0 輪" in msg and "收尾還有" in msg
+
+    def test_holding_shows_unrealized_and_exit_order(self):
+        bot, start = self._bot_in_progress("exit", cycles=2, gross=1.28)
+        [r] = self._report(bot, start + timedelta(minutes=125))
+        msg = r["message"]
+        assert "持倉 0.001 @ 84643.48" in msg and "未實現 +0.36" in msg  # (85000 − 84643.48) × 0.001
+        assert "平倉單 @ 85283.10" in msg
+        assert "已完成 2 輪|毛利合計 +1.28" in msg
+
+    def test_only_once_per_interval_and_disabled_with_zero(self):
+        bot, start = self._bot_in_progress("entry")
+        assert self._report(bot, start + timedelta(minutes=59)) == []
+        assert len(self._report(bot, start + timedelta(minutes=61))) == 1
+        assert self._report(bot, start + timedelta(minutes=90)) == []
+        bot._status_interval = 0
+        assert self._report(bot, start + timedelta(days=1)) == []
+
+    def test_interval_from_env(self, monkeypatch):
+        from app.bot import status_interval_minutes
+
+        monkeypatch.delenv("STATUS_INTERVAL_MINUTES", raising=False)
+        assert status_interval_minutes() == 60
+        monkeypatch.setenv("STATUS_INTERVAL_MINUTES", "15")
+        assert status_interval_minutes() == 15

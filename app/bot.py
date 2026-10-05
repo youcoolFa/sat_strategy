@@ -41,6 +41,24 @@ logger = setup_logger()
 
 HKT = ZoneInfo("Asia/Hong_Kong")
 
+DEFAULT_STATUS_INTERVAL_MINUTES = 60
+
+
+def status_interval_minutes():
+    """每小時狀態回報(⚪ #狀態)的間隔:.env 的 STATUS_INTERVAL_MINUTES,預設 60,0 = 關閉。"""
+    raw = os.getenv("STATUS_INTERVAL_MINUTES")
+    if not raw:
+        return DEFAULT_STATUS_INTERVAL_MINUTES
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return DEFAULT_STATUS_INTERVAL_MINUTES
+
+
+def _duration(delta):
+    minutes = max(int(delta.total_seconds() // 60), 0)
+    return f"{minutes // 60} 小時 {minutes % 60} 分"
+
 
 def compute_entry_price(origin_price, entry_deviation_pct):
     """買入價 = 起點價格 * (1 - 偏離百分比 / 100),四捨五入到小數第 2 位。"""
@@ -52,6 +70,11 @@ class SatStrategyBot:
         self.config = config
         self.exchange = self._build_exchange()
         self._stop_requested = False
+        # 每小時狀態回報(心跳):run() 開始後才有 _status;_wait_until_filled_or_stop 每次輪詢檢查
+        self._status_interval = status_interval_minutes()
+        self._status = None
+        self._started_at = None
+        self._next_status = None
         if self.config.use_live_ticker_feed:
             ticker_feed.start()
         signal.signal(signal.SIGTERM, self._handle_stop_signal)
@@ -266,19 +289,25 @@ class SatStrategyBot:
         entry_price = compute_entry_price(origin_price, self.config.entry_deviation_pct)
 
         # Telegram 事件:啟動/結束一律發;每一輪的成交只在實盤發(dry-run 每 5 秒就一輪,會洗版)
-        events = logger.bind(telegram=True)
-        trade_events = logger.bind(telegram=not self.config.dry_run)
+        events = logger.bind(telegram=True)  # 類別:系統(🔵 #系統)
+        trade_events = logger.bind(telegram=not self.config.dry_run, category="fill")  # 🟢 #成交
         qty = self.config.order_qty
+        status_note = f"\n每 {self._status_interval:g} 分鐘回報一次狀態" if self._status_interval > 0 else ""
         events.info(
             f"🚀 sat_strategy 啟動({self._mode_label()})\n"
             f"{self.config.symbol}|窗口結束 {window_end:%Y-%m-%d %H:%M} HKT\n"
             f"origin {origin_price:.2f} → 買入 {entry_price:.2f}(−{self.config.entry_deviation_pct}%)× {qty}\n"
-            f"平倉回到 origin {origin_price:.2f}"
+            f"平倉回到 origin {origin_price:.2f}{status_note}"
         )
         cycles = 0
         gross_total = 0.0
+        self._started_at = now
+        self._next_status = now + timedelta(minutes=self._status_interval)
+        self._status = {"origin": origin_price, "entry_price": entry_price, "qty": qty, "phase": "entry",
+                        "cycles": 0, "gross_total": 0.0, "window_end": window_end}
 
         while not self._stop_requested and not self._should_stop_for_cleanup(window_end):
+            self._status["phase"] = "entry"
             entry_order = self._place_entry_order(entry_price)
 
             filled_qty = self._wait_until_filled_or_stop(entry_order, window_end)
@@ -292,6 +321,7 @@ class SatStrategyBot:
 
             logger.info(f"買入盤已成交,qty={filled_qty:.4f}")
             trade_events.info(f"✅ 買入成交 {filled_qty} @ {entry_price:.2f},已掛平倉單 @ {origin_price:.2f}")
+            self._status.update(phase="exit", qty=filled_qty)
 
             # 已經買到手了,不管平倉單發生什麼事都不能回頭去補新的進場單——
             # 會在還沒平掉舊部位前又疊加一筆新部位。平倉單被取消就重掛一張新的
@@ -304,6 +334,7 @@ class SatStrategyBot:
                     cycles += 1
                     gross = (origin_price - entry_price) * filled_qty
                     gross_total += gross
+                    self._status.update(cycles=cycles, gross_total=gross_total, qty=qty)
                     trade_events.info(
                         f"💰 平倉成交 {filled_qty} @ {origin_price:.2f},第 {cycles} 輪完成,"
                         f"毛利 {gross:+.2f} USDT(未扣手續費);補回買單 @ {entry_price:.2f}"
@@ -318,9 +349,43 @@ class SatStrategyBot:
             ticker_feed.stop()
         logger.info("sat_strategy bot 結束")
         reason = "收到停止訊號" if self._stop_requested else "窗口到期"
-        events.info(
+        events.bind(category="pnl").info(  # 🟣 #損益
             f"🏁 sat_strategy 結束({reason})\n完成 {cycles} 輪,毛利合計 {gross_total:+.2f} USDT(未扣手續費)"
         )
+
+    def _maybe_report_status(self):
+        """時間到就發一則 ⚪ #狀態(心跳)。只有這時候才查一次現價;出錯只記本地 log,不影響交易。"""
+        if self._status is None or self._status_interval <= 0:
+            return
+        now = self._now_hkt()
+        if now < self._next_status:
+            return
+        while self._next_status <= now:  # 電腦睡著醒來後不要一次補發好幾則
+            self._next_status += timedelta(minutes=self._status_interval)
+        try:
+            price = self._get_last_price()
+            st = self._status
+            lines = [
+                f"⏱ sat_strategy 運作中({self._mode_label()})|已運行 {_duration(now - self._started_at)}",
+                f"{self.config.symbol}|現價 {price}(origin {st['origin']:.2f},{(price / st['origin'] - 1) * 100:+.2f}%)",
+            ]
+            if st["phase"] == "exit":
+                lines.append(
+                    f"狀態:持倉 {st['qty']} @ {st['entry_price']:.2f}|未實現 {(price - st['entry_price']) * st['qty']:+.2f}"
+                    f"|平倉單 @ {st['origin']:.2f}(距現價 {(st['origin'] / price - 1) * 100:+.2f}%)"
+                )
+            else:
+                lines.append(
+                    f"狀態:掛買單等待成交 @ {st['entry_price']:.2f} × {st['qty']}"
+                    f"(距現價 {(st['entry_price'] / price - 1) * 100:+.2f}%)"
+                )
+            lines.append(f"已完成 {st['cycles']} 輪|毛利合計 {st['gross_total']:+.2f} USDT(未扣手續費)")
+            cleanup = st["window_end"] - timedelta(minutes=self.config.cleanup_buffer_minutes)
+            lines.append(f"收尾還有 {_duration(cleanup - now)}({cleanup:%m-%d %H:%M})")
+        except Exception as e:  # noqa: BLE001  狀態回報出錯不能影響交易
+            logger.bind(telegram=False).warning(f"狀態回報失敗:{e}")
+            return
+        logger.bind(telegram=True, category="status").info("\n".join(lines))
 
     def _mode_label(self):
         if self.config.dry_run:
@@ -338,6 +403,7 @@ class SatStrategyBot:
         回傳成交數量;如果沒能等到成交就回傳 None (呼叫端會先取消該掛單,交給 _cleanup 統一處理)。
         """
         while True:
+            self._maybe_report_status()
             if self._stop_requested or self._should_stop_for_cleanup(window_end):
                 self._cancel_order(order)
                 return None

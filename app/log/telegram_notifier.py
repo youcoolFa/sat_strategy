@@ -15,6 +15,10 @@ Telegram 發送器:logger_setup.py 把它的 `sink` 接到 loguru,出問題(WARN
     - 不會自己觸發自己:發送失敗只用 `logger.bind(telegram=False)` 記本地 log,
       telegram_filter 會擋掉,不會變成「發送失敗 → 記 WARNING → 再發送」的迴圈。
     - 程式結束前(atexit)最多等 10 秒把 queue 裡的訊息送完,崩潰訊息才不會遺失。
+    - 類別樣式:Telegram 文字不能上色,改用「彩色圓點 + hashtag」當標題(點 hashtag 可以
+      篩出同一類訊息)。事件用 logger.bind(telegram=True, category="fill") 指定類別,
+      沒指定 = 系統;WARNING/ERROR/CRITICAL 依等級。用 HTML 模式(標題粗體),訊息內容
+      一律轉義;萬一 Telegram 還是拒絕(400),改用純文字重送一次。
 
 環境變數:TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID(在 .env,不進 git)。
 """
@@ -22,7 +26,9 @@ Telegram 發送器:logger_setup.py 把它的 `sink` 接到 loguru,出問題(WARN
 from __future__ import annotations
 
 import atexit
+import html
 import os
+import re
 import queue
 import threading
 import time
@@ -32,7 +38,18 @@ import requests
 from loguru import logger
 
 MAX_MESSAGE_CHARS = 4000  # Telegram 上限 4096,留一點餘裕
-ICONS = {"SUCCESS": "✅", "INFO": "ℹ️", "WARNING": "⚠️", "ERROR": "🔴", "CRITICAL": "🆘"}
+MAX_BODY_CHARS = 3500  # 訊息內容先截到這個長度再轉義,避免截斷時切壞 HTML
+# 事件類別:logger.bind(telegram=True, category=<key>)。沒指定類別的事件 = system。
+CATEGORY_STYLES = {
+    "system": ("🔵", "系統"),  # 啟動、停止、重連
+    "fill": ("🟢", "成交"),  # 買入、賣出、平倉成交
+    "pnl": ("🟣", "損益"),  # 每輪/每個 event 損益、結束總結
+    "position": ("🟠", "持倉"),  # 開倉、平倉、反手
+    "equity": ("🟤", "權益"),  # 權益大幅變動
+    "status": ("⚪", "狀態"),  # 定時狀態回報(心跳):收到 = 還活著
+}
+LEVEL_STYLES = {"WARNING": ("🟡", "警告"), "ERROR": ("🔴", "錯誤"), "CRITICAL": ("🆘", "嚴重")}
+_TAG_RE = re.compile(r"<[^>]+>")
 _WARNING_NO = 30
 
 
@@ -72,7 +89,7 @@ class TelegramNotifier:
         self.clock = clock
         self.connected: Optional[bool] = None  # None = 還沒測試過
         self.dropped = 0  # 沒送出去的訊息數(queue 滿、重試用完)
-        self._queue: "queue.Queue[str]" = queue.Queue(maxsize=max_queue)
+        self._queue: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue(maxsize=max_queue)
         # 發生位置 -> (上次發送時間, 冷卻期間略過幾則, 目前冷卻秒數)
         self._throttle: Dict[Tuple[str, str, int], Tuple[float, int, float]] = {}
         self._lock = threading.Lock()
@@ -86,14 +103,14 @@ class TelegramNotifier:
 
     # ---------- 對外 ----------
 
-    def notify(self, text: str) -> bool:
-        """直接發一則訊息(不經過 log)。不阻塞;回傳是否成功放進發送 queue。"""
+    def notify(self, text: str, parse_mode: Optional[str] = None) -> bool:
+        """直接發一則訊息(不經過 log;預設純文字)。不阻塞;回傳是否成功放進發送 queue。"""
         if not self.enabled:
             return False
         if len(text) > MAX_MESSAGE_CHARS:
             text = text[: MAX_MESSAGE_CHARS - 20] + "\n…(訊息過長已截斷)"
         try:
-            self._queue.put_nowait(text)
+            self._queue.put_nowait((text, parse_mode))
             return True
         except queue.Full:
             self.dropped += 1
@@ -110,21 +127,37 @@ class TelegramNotifier:
                 if suppressed is None:
                     return
                 if suppressed:
-                    suffix = f"\n(上次通知後,同一位置的訊息另外略過 {suppressed} 則)"
-            self.notify(self.format(record) + suffix)
+                    suffix = f"\n<i>(上次通知後,同一位置的訊息另外略過 {suppressed} 則)</i>"
+            self.notify(self.format(record) + suffix, parse_mode="HTML")
         except Exception:  # noqa: BLE001  sink 出錯不能影響主程式
             pass
 
-    def format(self, record: Dict[str, Any]) -> str:
+    def style(self, record: Dict[str, Any]) -> Tuple[str, str]:
+        """(彩色圓點, 類別標籤)。出問題依等級;事件依 category,沒指定 = 系統。"""
         level = record["level"].name
-        icon = ICONS.get(level, "•")
+        if level in LEVEL_STYLES:
+            return LEVEL_STYLES[level]
+        return CATEGORY_STYLES.get(record["extra"].get("category"), CATEGORY_STYLES["system"])
+
+    def format(self, record: Dict[str, Any]) -> str:
+        """HTML:粗體標題(圓點 + #類別 + 專案)、斜體時間(出問題時再加程式位置)、內容。"""
+        icon, tag = self.style(record)
         when = record["time"].strftime("%Y-%m-%d %H:%M:%S")
-        lines = [f"{icon} {level}｜{self.project}", f"{when}｜{record['name']}:{record['function']}:{record['line']}",
-                 "", str(record["message"])]
+        meta = when
+        if record["level"].name in LEVEL_STYLES:  # 出問題才需要知道是哪一行;事件不用
+            meta += f"｜{record['name']}:{record['function']}:{record['line']}"
+        body = str(record["message"])
         exc = record.get("exception")
         if exc is not None and exc.type is not None:
-            lines.append(f"\n{exc.type.__name__}: {exc.value}")
-        return "\n".join(lines)
+            body += f"\n\n{exc.type.__name__}: {exc.value}"
+        if len(body) > MAX_BODY_CHARS:
+            body = body[:MAX_BODY_CHARS] + "\n…(訊息過長已截斷)"
+        return (f"<b>{icon} #{tag}｜{html.escape(self.project)}</b>\n<i>{html.escape(meta)}</i>\n\n"
+                f"{html.escape(body)}")
+
+    @staticmethod
+    def to_plain(text: str) -> str:
+        return html.unescape(_TAG_RE.sub("", text))
 
     def check_connection(self) -> bool:
         """呼叫 getMe 驗證連線,狀態變化記本地 log。給定期健康檢查用。"""
@@ -169,22 +202,34 @@ class TelegramNotifier:
 
     def _worker(self) -> None:
         while True:
-            text = self._queue.get()
+            text, parse_mode = self._queue.get()
             try:
-                self._send(text)
+                self._send(text, parse_mode)
             finally:
                 self._queue.task_done()
 
-    def _send(self, text: str) -> None:
+    def _send(self, text: str, parse_mode: Optional[str] = None) -> None:
         local = logger.bind(telegram=False)
         for attempt in range(self.max_retries):
+            data = {"chat_id": self.chat_id, "text": text}
+            if parse_mode:
+                data["parse_mode"] = parse_mode
             try:
-                resp = self.session.post(
-                    self._api_url("sendMessage"), data={"chat_id": self.chat_id, "text": text}, timeout=self.timeout,
-                )
+                resp = self.session.post(self._api_url("sendMessage"), data=data, timeout=self.timeout)
                 resp.raise_for_status()
                 self._update_connection_state(True)
                 return
+            except requests.HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                if parse_mode and status == 400:
+                    # 格式被拒(例如 HTML 解析失敗):改純文字重送,內容比格式重要
+                    local.warning("Telegram 拒絕 HTML 格式,改用純文字重送")
+                    text, parse_mode = self.to_plain(text), None
+                    continue
+                self._update_connection_state(False)
+                local.warning(f"Telegram 發送失敗,第 {attempt + 1}/{self.max_retries} 次:HTTP {status}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_base_seconds * (2 ** attempt))
             except requests.RequestException as exc:
                 self._update_connection_state(False)
                 local.warning(f"Telegram 發送失敗,第 {attempt + 1}/{self.max_retries} 次:{type(exc).__name__}")

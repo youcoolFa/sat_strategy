@@ -10,23 +10,26 @@ from app.log.telegram_notifier import TelegramNotifier, telegram_filter
 
 
 class FakeResponse:
-    def __init__(self, ok=True):
+    def __init__(self, ok=True, status_code=200):
         self._ok = ok
+        self.status_code = status_code
 
     def raise_for_status(self):
         if not self._ok:
             import requests
 
-            raise requests.HTTPError("500")
+            raise requests.HTTPError(str(self.status_code), response=self)
 
     def json(self):
         return {"ok": self._ok}
 
 
 class FakeSession:
-    def __init__(self, fail_times=0):
+    def __init__(self, fail_times=0, reject_html=False):
         self.sent = []
+        self.modes = []  # 每則用的 parse_mode(None = 純文字)
         self.fail_times = fail_times
+        self.reject_html = reject_html
 
     def post(self, url, data, timeout):
         if self.fail_times > 0:
@@ -34,7 +37,10 @@ class FakeSession:
             import requests
 
             raise requests.ConnectionError("network down")
+        if self.reject_html and data.get("parse_mode") == "HTML":
+            return FakeResponse(ok=False, status_code=400)  # Bad Request: can't parse entities
         self.sent.append(data["text"])
+        self.modes.append(data.get("parse_mode"))
         return FakeResponse()
 
     def get(self, url, timeout):
@@ -141,7 +147,7 @@ class TestSinkFormat:
         n = make(session)
         log_through(n, captured, lambda: logger.warning("WebSocket 斷線"))
         [text] = session.sent
-        assert "⚠️ WARNING" in text and "Bybit WebSocket" in text
+        assert "🟡 #警告" in text and "Bybit WebSocket" in text
         assert "WebSocket 斷線" in text
         assert "test_telegram_notifier" in text  # 發生位置(模組:函式:行)
 
@@ -157,14 +163,14 @@ class TestSinkFormat:
 
         log_through(n, captured, boom)
         [text] = session.sent
-        assert "🔴 ERROR" in text and "ZeroDivisionError" in text
+        assert "🔴 #錯誤" in text and "ZeroDivisionError" in text
 
     def test_marked_info_event_is_sent_with_event_icon(self, captured):
         session = FakeSession()
         n = make(session)
         log_through(n, captured, lambda: logger.bind(telegram=True).info("已啟動"))
         [text] = session.sent
-        assert "ℹ️" in text and "已啟動" in text
+        assert "🔵 #系統" in text and "已啟動" in text  # 沒指定類別的事件 = 系統
 
     def test_plain_info_is_not_sent(self, captured):
         session = FakeSession()
@@ -268,3 +274,58 @@ class TestThrottleBackoff:
         clock.t += 301
         log_through(n, captured, tick)
         assert len(session.sent) == 4
+
+
+class TestCategoryStyles:
+    """Telegram 文字不能上色:用「彩色圓點 + hashtag」區分類別。點 hashtag 可以篩出同類訊息。"""
+
+    @pytest.mark.parametrize("category, expected", [
+        ("system", "🔵 #系統"), ("fill", "🟢 #成交"), ("pnl", "🟣 #損益"),
+        ("position", "🟠 #持倉"), ("equity", "🟤 #權益"), ("status", "⚪ #狀態"),
+    ])
+    def test_event_categories(self, captured, category, expected):
+        session = FakeSession()
+        n = make(session)
+        log_through(n, captured, lambda: logger.bind(telegram=True, category=category).info("內容"))
+        assert session.sent[0].startswith(f"<b>{expected}｜Bybit WebSocket</b>")
+
+    def test_critical_has_its_own_style(self, captured):
+        session = FakeSession()
+        n = make(session)
+        log_through(n, captured, lambda: logger.critical("資料庫掛了"))
+        assert "🆘 #嚴重" in session.sent[0]
+
+    def test_events_omit_the_code_location_but_problems_keep_it(self, captured):
+        session = FakeSession()
+        n = make(session)
+
+        def both():
+            logger.bind(telegram=True, category="fill").info("成交")
+            logger.warning("出問題")
+
+        log_through(n, captured, both)
+        event, problem = session.sent
+        assert "<i>" in event and ":both:" not in event
+        assert ":both:" in problem
+
+    def test_sent_as_html_with_message_text_escaped(self, captured):
+        session = FakeSession()
+        n = make(session)
+        log_through(n, captured, lambda: logger.warning("price<0 & qty>1"))
+        assert session.modes == ["HTML"]
+        assert "price&lt;0 &amp; qty&gt;1" in session.sent[0]
+
+    def test_falls_back_to_plain_text_when_telegram_rejects_the_html(self, captured):
+        session = FakeSession(reject_html=True)
+        n = make(session)
+        log_through(n, captured, lambda: logger.warning("price<0"))
+        assert session.modes == [None]
+        assert "🟡 #警告" in session.sent[0] and "price<0" in session.sent[0] and "<b>" not in session.sent[0]
+        assert n.dropped == 0
+
+    def test_plain_notify_is_not_html(self):
+        session = FakeSession()
+        n = make(session)
+        n.notify("a<b")
+        n.flush(timeout=5)
+        assert session.sent == ["a<b"] and session.modes == [None]
