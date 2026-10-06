@@ -42,6 +42,16 @@ logger = setup_logger()
 HKT = ZoneInfo("Asia/Hong_Kong")
 
 DEFAULT_STATUS_INTERVAL_MINUTES = 60
+# 交易所沒回報手續費時(dry-run、ccxt 沒解析到)用這個掛單費率估算,訊息會標「估算」
+MAKER_FEE_ESTIMATE = 0.0002
+
+
+def fee_ratio(gross, fees):
+    """手續費佔利益(或虧損)的比率,小數點後兩位:手續費 ÷ |毛利|。"""
+    if gross == 0:
+        return "毛利為 0,無法算手續費比率"
+    kind = "利益" if gross > 0 else "虧損"
+    return f"手續費佔{kind} {fees / abs(gross) * 100:.2f}%"
 
 
 def status_interval_minutes():
@@ -75,6 +85,7 @@ class SatStrategyBot:
         self._status = None
         self._started_at = None
         self._next_status = None
+        self._last_fill_fee = None  # 最近一張成交單的 (手續費, 是否估算),_take_fill_fee() 取用後清空
         if self.config.use_live_ticker_feed:
             ticker_feed.start()
         signal.signal(signal.SIGTERM, self._handle_stop_signal)
@@ -301,10 +312,12 @@ class SatStrategyBot:
         )
         cycles = 0
         gross_total = 0.0
+        fees_total = 0.0
+        fees_estimated = False
         self._started_at = now
         self._next_status = now + timedelta(minutes=self._status_interval)
         self._status = {"origin": origin_price, "entry_price": entry_price, "qty": qty, "phase": "entry",
-                        "cycles": 0, "gross_total": 0.0, "window_end": window_end}
+                        "cycles": 0, "gross_total": 0.0, "fees_total": 0.0, "window_end": window_end}
 
         while not self._stop_requested and not self._should_stop_for_cleanup(window_end):
             self._status["phase"] = "entry"
@@ -320,6 +333,7 @@ class SatStrategyBot:
                 continue
 
             logger.info(f"買入盤已成交,qty={filled_qty:.4f}")
+            entry_fee, entry_fee_est = self._take_fill_fee(entry_price, filled_qty)
             trade_events.info(f"✅ 買入成交 {filled_qty} @ {entry_price:.2f},已掛平倉單 @ {origin_price:.2f}")
             self._status.update(phase="exit", qty=filled_qty)
 
@@ -332,12 +346,19 @@ class SatStrategyBot:
                 if exit_filled is not None:
                     logger.info("平倉盤已成交,這次交易完成,準備補回新的買入盤")
                     cycles += 1
+                    exit_fee, exit_fee_est = self._take_fill_fee(origin_price, filled_qty)
                     gross = (origin_price - entry_price) * filled_qty
+                    fees = entry_fee + exit_fee
+                    estimated = entry_fee_est or exit_fee_est
+                    fees_estimated = fees_estimated or estimated
                     gross_total += gross
-                    self._status.update(cycles=cycles, gross_total=gross_total, qty=qty)
+                    fees_total += fees
+                    self._status.update(cycles=cycles, gross_total=gross_total, fees_total=fees_total, qty=qty)
+                    note = "(手續費為估算)" if estimated else ""
                     trade_events.info(
-                        f"💰 平倉成交 {filled_qty} @ {origin_price:.2f},第 {cycles} 輪完成,"
-                        f"毛利 {gross:+.2f} USDT(未扣手續費);補回買單 @ {entry_price:.2f}"
+                        f"💰 平倉成交 {filled_qty} @ {origin_price:.2f},第 {cycles} 輪完成\n"
+                        f"淨利 {gross - fees:+.2f} USDT(毛利 {gross:+.2f} − 手續費 {fees:.4f}){note}|"
+                        f"{fee_ratio(gross, fees)}\n補回買單 @ {entry_price:.2f}"
                     )
                     break
                 if self._stop_requested or self._should_stop_for_cleanup(window_end):
@@ -350,8 +371,23 @@ class SatStrategyBot:
         logger.info("sat_strategy bot 結束")
         reason = "收到停止訊號" if self._stop_requested else "窗口到期"
         events.bind(category="pnl").info(  # 🟣 #損益
-            f"🏁 sat_strategy 結束({reason})\n完成 {cycles} 輪,毛利合計 {gross_total:+.2f} USDT(未扣手續費)"
+            f"🏁 sat_strategy 結束({reason})\n完成 {cycles} 輪,淨利合計 {gross_total - fees_total:+.2f} USDT"
+            f"(毛利 {gross_total:+.2f} − 手續費 {fees_total:.4f}){'(含估算)' if fees_estimated else ''}|"
+            f"{fee_ratio(gross_total, fees_total)}"
         )
+
+    def _remember_fill_fee(self, status, filled):
+        """成交時記下這張單的手續費:優先用交易所回報(ccxt 的 fee.cost,Bybit cumExecFee);
+        沒有就留給 _take_fill_fee() 用掛單費率估算。"""
+        cost = (status.get("fee") or {}).get("cost") if isinstance(status, dict) else None
+        self._last_fill_fee = (float(cost), False) if cost is not None else None
+
+    def _take_fill_fee(self, price, qty):
+        """取出最近一張成交單的 (手續費, 是否估算);沒有交易所數字 → 價格 × 數量 × 掛單費率。"""
+        fee, self._last_fill_fee = self._last_fill_fee, None
+        if fee is not None:
+            return fee
+        return price * qty * MAKER_FEE_ESTIMATE, True
 
     def _maybe_report_status(self):
         """時間到就發一則 ⚪ #狀態(心跳)。只有這時候才查一次現價;出錯只記本地 log,不影響交易。"""
@@ -379,9 +415,11 @@ class SatStrategyBot:
                     f"狀態:掛買單等待成交 @ {st['entry_price']:.2f} × {st['qty']}"
                     f"(距現價 {(st['entry_price'] / price - 1) * 100:+.2f}%)"
                 )
-            lines.append(f"已完成 {st['cycles']} 輪|毛利合計 {st['gross_total']:+.2f} USDT(未扣手續費)")
+            gross, fees = st["gross_total"], st.get("fees_total", 0.0)
+            lines.append(f"已完成 {st['cycles']} 輪|淨利合計 {gross - fees:+.2f} USDT(毛利 {gross:+.2f} − 手續費 "
+                         f"{fees:.4f})|{fee_ratio(gross, fees)}")
             cleanup = st["window_end"] - timedelta(minutes=self.config.cleanup_buffer_minutes)
-            lines.append(f"收尾還有 {_duration(cleanup - now)}({cleanup:%m-%d %H:%M})")
+            lines.append(f"距強制收尾還有 {_duration(cleanup - now)}({cleanup:%m-%d %H:%M},到時取消掛單、市價平倉)")
         except Exception as e:  # noqa: BLE001  狀態回報出錯不能影響交易
             logger.bind(telegram=False).warning(f"狀態回報失敗:{e}")
             return
@@ -423,6 +461,7 @@ class SatStrategyBot:
                 time.sleep(self.config.poll_interval_seconds)
                 return self.config.order_qty
             if status["status"] == "closed":
+                self._remember_fill_fee(status, float(status["filled"]))
                 return float(status["filled"])
             if status["status"] in ("canceled", "expired", "rejected"):
                 logger.warning(f"訂單 {order['id']} 狀態異常: {status['status']}")

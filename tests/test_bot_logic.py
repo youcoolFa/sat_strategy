@@ -284,8 +284,11 @@ class TestTelegramEvents:
         start, bought, closed, end = msgs
         assert "啟動" in start and "實盤" in start and "85283.10" in start and "84643.48" in start
         assert "買入成交" in bought
-        assert "平倉成交" in closed and "+0.64" in closed  # (85283.10 − 84643.48) × 0.001
-        assert "結束" in end and "完成 1 輪" in end
+        assert "平倉成交" in closed and "毛利 +0.64" in closed  # (85283.10 − 84643.48) × 0.001
+        # 這個測試沒有交易所回報的手續費 → 用掛單費率 0.02% 估算並標註
+        assert "淨利 +0.61" in closed and "手續費 0.0340" in closed and "估算" in closed
+        assert "手續費佔利益 5.31%" in closed  # 0.033985 ÷ 0.63962
+        assert "結束" in end and "完成 1 輪" in end and "淨利合計 +0.61" in end and "手續費佔利益 5.31%" in end
 
     def test_dry_run_only_sends_start_and_end(self):
         msgs = self._run_one_cycle(dry_run=True)
@@ -345,7 +348,7 @@ class TestStatusReport:
         bot._started_at = start
         bot._next_status = start + timedelta(minutes=60)
         bot._status = {"origin": 85283.10, "entry_price": 84643.48, "qty": 0.001, "phase": phase,
-                       "cycles": cycles, "gross_total": gross,
+                       "cycles": cycles, "gross_total": gross, "fees_total": 0.02 * cycles,
                        "window_end": datetime(2026, 10, 12, 6, 0, tzinfo=HKT)}
         return bot, start
 
@@ -378,7 +381,7 @@ class TestStatusReport:
         msg = r["message"]
         assert "持倉 0.001 @ 84643.48" in msg and "未實現 +0.36" in msg  # (85000 − 84643.48) × 0.001
         assert "平倉單 @ 85283.10" in msg
-        assert "已完成 2 輪|毛利合計 +1.28" in msg
+        assert "已完成 2 輪|淨利合計 +1.24 USDT(毛利 +1.28 − 手續費 0.0400)|手續費佔利益 3.12%" in msg
 
     def test_only_once_per_interval_and_disabled_with_zero(self):
         bot, start = self._bot_in_progress("entry")
@@ -395,3 +398,22 @@ class TestStatusReport:
         assert status_interval_minutes() == 60
         monkeypatch.setenv("STATUS_INTERVAL_MINUTES", "15")
         assert status_interval_minutes() == 15
+
+
+class TestFees:
+    def test_fee_comes_from_the_exchange_order_when_reported(self):
+        bot = make_bot(dry_run=False, testnet=False)
+        bot._remember_fill_fee({"fee": {"cost": 0.0123, "currency": "USDT"}, "average": 84643.48}, 0.001)
+        assert bot._take_fill_fee(84643.48, 0.001) == (0.0123, False)
+
+    def test_missing_fee_is_estimated_with_maker_rate(self):
+        bot = make_bot(dry_run=False, testnet=False)
+        bot._remember_fill_fee({"fee": None, "average": 84643.48}, 0.001)
+        fee, estimated = bot._take_fill_fee(84643.48, 0.001)
+        assert fee == pytest.approx(84643.48 * 0.001 * 0.0002) and estimated is True
+
+    def test_fee_ratio(self):
+        from app.bot import fee_ratio
+
+        assert fee_ratio(0.1440, 0.0286) == "手續費佔利益 19.86%"
+        assert fee_ratio(-0.5, 0.0286) == "手續費佔虧損 5.72%"
