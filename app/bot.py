@@ -26,6 +26,7 @@ import os
 import signal
 import time
 from datetime import datetime, timedelta
+from typing import NamedTuple, Optional
 from zoneinfo import ZoneInfo
 
 import ccxt
@@ -44,6 +45,16 @@ HKT = ZoneInfo("Asia/Hong_Kong")
 DEFAULT_STATUS_INTERVAL_MINUTES = 60
 # 交易所沒回報手續費時(dry-run、ccxt 沒解析到)用這個掛單費率估算,訊息會標「估算」
 MAKER_FEE_ESTIMATE = 0.0002
+# 收尾市價平倉查不到手續費時用吃單費率估算
+TAKER_FEE_ESTIMATE = 0.00055
+
+
+class ForcedClose(NamedTuple):
+    """收尾時用市價平掉的部位(_cleanup 回傳),結束總結要把它的損益和手續費算進去。"""
+    qty: float
+    price: float
+    fee: float
+    fee_estimated: bool
 
 
 def fee_ratio(gross, fees):
@@ -206,8 +217,10 @@ class SatStrategyBot:
                 return float(p["contracts"])
         return 0.0
 
-    def _cleanup(self):
+    def _cleanup(self) -> Optional[ForcedClose]:
+        """取消所有掛單、市價平掉剩下的部位。有市價平倉就回傳 ForcedClose(成交價、手續費),否則 None。"""
         logger.bind(telegram=False).warning("開始清理:取消所有未成交掛單,市價平掉未平倉部位")
+        forced = None
         # 這是最後一道防線,絕對不能因為網路暫時失敗就放棄——寧可整段清理流程
         # 重來(冪等:重查一次未成交掛單/持倉,不會重複下單),也不要留下沒人管的
         # 真實掛單或部位。
@@ -225,16 +238,40 @@ class SatStrategyBot:
                 if remaining_qty > 0:
                     logger.warning(f"還有 {remaining_qty:.4f} 未平倉,用市價平倉")
                     if not self.config.dry_run:
-                        self._call_with_retry(
+                        order = self._call_with_retry(
                             "市價平倉",
                             self.exchange.create_market_sell_order,
                             self.config.symbol, remaining_qty, {"reduceOnly": True},
                         )
+                        forced = self._forced_close_details(order, remaining_qty)
                 break
             except ccxt.NetworkError as e:
                 logger.warning(f"清理過程網路持續失敗,{self.config.poll_interval_seconds} 秒後重新跑一次整個清理流程,不會放棄: {e}")
                 time.sleep(self.config.poll_interval_seconds)
         logger.info("清理完成")
+        return forced
+
+    def _forced_close_details(self, order, qty) -> ForcedClose:
+        """市價平倉的成交均價與手續費:Bybit 下單回應只有 id,要再查一次訂單。查不到(或欄位沒有)
+        就用現價 / 吃單費率估算——只影響 Telegram 總結的數字,絕不能讓清理流程因此失敗。"""
+        price, fee = None, None
+        try:
+            closed = self._call_with_retry(
+                "查詢市價平倉成交", self.exchange.fetch_closed_order, order["id"], self.config.symbol
+            )
+            price = closed.get("average") or closed.get("price")
+            fee = (closed.get("fee") or {}).get("cost")
+        except Exception as e:  # noqa: BLE001
+            logger.bind(telegram=False).warning(f"查不到市價平倉的成交明細,改用現價估算: {e}")
+        if not price:
+            try:
+                price = self._get_last_price()
+            except Exception:  # noqa: BLE001
+                price = 0.0
+        price = float(price)
+        if fee is not None:
+            return ForcedClose(qty, price, float(fee), False)
+        return ForcedClose(qty, price, price * qty * TAKER_FEE_ESTIMATE, True)
 
     # ------------------------------------------------------------------
     # 時間窗口判斷 (HKT)
@@ -293,7 +330,7 @@ class SatStrategyBot:
 
         if self.config.cleanup_on_start:
             logger.warning("=== 崩潰後重啟:先清理上一個 process 留下的掛單/部位,再重新開始 ===")
-            self._cleanup()
+            self._cleanup()  # 上一個 process 的部位,不算進這次的損益
 
         origin_price = self._get_last_price()
         logger.info(f"起點價格 (origin_price) = {origin_price:.2f}")
@@ -314,6 +351,7 @@ class SatStrategyBot:
         gross_total = 0.0
         fees_total = 0.0
         fees_estimated = False
+        open_entry = None  # 已買入、還沒平倉的那一筆 (買入價, 數量, 手續費, 是否估算);收尾被市價平掉時要算進總結
         self._started_at = now
         self._next_status = now + timedelta(minutes=self._status_interval)
         self._status = {"origin": origin_price, "entry_price": entry_price, "qty": qty, "phase": "entry",
@@ -334,6 +372,7 @@ class SatStrategyBot:
 
             logger.info(f"買入盤已成交,qty={filled_qty:.4f}")
             entry_fee, entry_fee_est = self._take_fill_fee(entry_price, filled_qty)
+            open_entry = (entry_price, filled_qty, entry_fee, entry_fee_est)
             trade_events.info(f"✅ 買入成交 {filled_qty} @ {entry_price:.2f},已掛平倉單 @ {origin_price:.2f}")
             self._status.update(phase="exit", qty=filled_qty)
 
@@ -346,6 +385,7 @@ class SatStrategyBot:
                 if exit_filled is not None:
                     logger.info("平倉盤已成交,這次交易完成,準備補回新的買入盤")
                     cycles += 1
+                    open_entry = None
                     exit_fee, exit_fee_est = self._take_fill_fee(origin_price, filled_qty)
                     gross = (origin_price - entry_price) * filled_qty
                     fees = entry_fee + exit_fee
@@ -365,15 +405,25 @@ class SatStrategyBot:
                     break  # 平倉盤還沒成交就到清理時間了,交給 _cleanup 處理
                 logger.warning("平倉單被取消/拒絕/過期,還沒到清理時間,重新掛一張新的平倉單")
 
-        self._cleanup()
+        forced = self._cleanup()
+        forced_line = ""
+        if open_entry is not None and isinstance(forced, ForcedClose):
+            bought_at, _, bought_fee, bought_est = open_entry
+            gross = (forced.price - bought_at) * forced.qty
+            gross_total += gross
+            fees_total += bought_fee + forced.fee
+            fees_estimated = fees_estimated or bought_est or forced.fee_estimated
+            forced_line = (f"\n收尾市價平倉 {forced.qty:g} @ {forced.price:.2f}(買入 {bought_at:.2f}),"
+                           f"毛利 {gross:+.2f}")
         if self.config.use_live_ticker_feed:
             ticker_feed.stop()
         logger.info("sat_strategy bot 結束")
         reason = "收到停止訊號" if self._stop_requested else "窗口到期"
         events.bind(category="pnl").info(  # 🟣 #損益
-            f"🏁 sat_strategy 結束({reason})\n完成 {cycles} 輪,淨利合計 {gross_total - fees_total:+.2f} USDT"
+            f"🏁 sat_strategy 結束({reason})\n完成 {cycles} 輪{',收尾市價平倉 1 筆' if forced_line else ''},"
+            f"淨利合計 {gross_total - fees_total:+.2f} USDT"
             f"(毛利 {gross_total:+.2f} − 手續費 {fees_total:.4f}){'(含估算)' if fees_estimated else ''}|"
-            f"{fee_ratio(gross_total, fees_total)}"
+            f"{fee_ratio(gross_total, fees_total)}{forced_line}"
         )
 
     def _remember_fill_fee(self, status, filled):
