@@ -20,7 +20,16 @@ Telegram 發送器:logger_setup.py 把它的 `sink` 接到 loguru,出問題(WARN
       沒指定 = 系統;WARNING/ERROR/CRITICAL 依等級。用 HTML 模式(標題粗體),訊息內容
       一律轉義;萬一 Telegram 還是拒絕(400),改用純文字重送一次。
 
-環境變數:TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID(在 .env,不進 git)。
+    - 三個 bot(2026-10-11 使用者要求;四個專案共用後兩個,使用者只讓這兩個有聲音):
+        交易快報 @Fa_trade_notice_bot:🟢 成交、🟣 權益(資產大變動)、確定的成交失敗
+                 (logger.bind(trade=True).error(...):重試用完、交易所拒絕、收尾平倉失敗)
+        系統警報 @Fa_sys_alert_bot:其他所有 🟡 警告 / 🔴 錯誤 / 🆘 嚴重(網路重試中、資料庫、當掉…)
+        原本的專案 bot(靜音):⚪ 系統、🔵 損益、🟠 持倉、⚫ 狀態
+      只送一邊、不重複;標題有專案名稱;沒設定的 bot 改送原本的 bot,不會漏。
+
+環境變數(在 .env,不進 git):TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID(原本的 bot);
+TELEGRAM_TRADE_BOT_TOKEN(交易快報,選填)、TELEGRAM_SYSTEM_BOT_TOKEN(系統警報,選填);
+chat id 預設共用 TELEGRAM_CHAT_ID,要送到別處才另外寫 TELEGRAM_TRADE_CHAT_ID / TELEGRAM_SYSTEM_CHAT_ID。
 """
 
 from __future__ import annotations
@@ -40,15 +49,18 @@ from loguru import logger
 MAX_MESSAGE_CHARS = 4000  # Telegram 上限 4096,留一點餘裕
 MAX_BODY_CHARS = 3500  # 訊息內容先截到這個長度再轉義,避免截斷時切壞 HTML
 # 事件類別:logger.bind(telegram=True, category=<key>)。沒指定類別的事件 = system。
+# 顏色 2026-10-11 使用者指定
 CATEGORY_STYLES = {
-    "system": ("🔵", "系統"),  # 啟動、停止、重連
+    "system": ("⚪", "系統"),  # 啟動、停止、重連
     "fill": ("🟢", "成交"),  # 買入、賣出、平倉成交
-    "pnl": ("🟣", "損益"),  # 每輪/每個 event 損益、結束總結
+    "pnl": ("🔵", "損益"),  # 每輪/每個 event 損益、結束總結
     "position": ("🟠", "持倉"),  # 開倉、平倉、反手
-    "equity": ("🟤", "權益"),  # 權益大幅變動
-    "status": ("⚪", "狀態"),  # 定時狀態回報(心跳):收到 = 還活著
+    "equity": ("🟣", "權益"),  # 權益大幅變動
+    "status": ("⚫", "狀態"),  # 定時狀態回報(心跳):收到 = 還活著
 }
 LEVEL_STYLES = {"WARNING": ("🟡", "警告"), "ERROR": ("🔴", "錯誤"), "CRITICAL": ("🆘", "嚴重")}
+# 送「交易快報」的事件類別;另外 logger.bind(trade=True) 的 WARNING 以上(確定的成交失敗)也是
+TRADE_CATEGORIES = {"fill", "equity"}
 _TAG_RE = re.compile(r"<[^>]+>")
 _WARNING_NO = 30
 
@@ -67,6 +79,10 @@ class TelegramNotifier:
         project: str,
         bot_token: Optional[str] = None,
         chat_id: Optional[str] = None,
+        trade_bot_token: Optional[str] = None,
+        trade_chat_id: Optional[str] = None,
+        system_bot_token: Optional[str] = None,
+        system_chat_id: Optional[str] = None,
         timeout: float = 10,
         max_retries: int = 3,
         retry_base_seconds: float = 1.0,
@@ -80,6 +96,15 @@ class TelegramNotifier:
         self.project = project
         self.bot_token = bot_token if bot_token is not None else os.getenv("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = chat_id if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID", "")
+        def env(value: Optional[str], key: str) -> str:
+            return value if value is not None else os.getenv(key, "")
+
+        # 三個 bot 都私訊給使用者自己 → chat id 是同一個(使用者的帳號);沒另外寫就用 TELEGRAM_CHAT_ID。
+        # 要送到別的地方(例如群組)才另外寫 TELEGRAM_TRADE_CHAT_ID / TELEGRAM_SYSTEM_CHAT_ID。
+        self.trade_bot_token = env(trade_bot_token, "TELEGRAM_TRADE_BOT_TOKEN")
+        self.trade_chat_id = env(trade_chat_id, "TELEGRAM_TRADE_CHAT_ID") or self.chat_id
+        self.system_bot_token = env(system_bot_token, "TELEGRAM_SYSTEM_BOT_TOKEN")
+        self.system_chat_id = env(system_chat_id, "TELEGRAM_SYSTEM_CHAT_ID") or self.chat_id
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_base_seconds = retry_base_seconds
@@ -89,11 +114,11 @@ class TelegramNotifier:
         self.clock = clock
         self.connected: Optional[bool] = None  # None = 還沒測試過
         self.dropped = 0  # 沒送出去的訊息數(queue 滿、重試用完)
-        self._queue: "queue.Queue[Tuple[str, Optional[str]]]" = queue.Queue(maxsize=max_queue)
+        self._queue: "queue.Queue[Tuple[str, Optional[str], str]]" = queue.Queue(maxsize=max_queue)
         # 發生位置 -> (上次發送時間, 冷卻期間略過幾則, 目前冷卻秒數)
         self._throttle: Dict[Tuple[str, str, int], Tuple[float, int, float]] = {}
         self._lock = threading.Lock()
-        if start_worker and self.enabled:
+        if start_worker and (self.enabled or self.trade_enabled or self.system_enabled):
             threading.Thread(target=self._worker, daemon=True, name="telegram-notifier").start()
             atexit.register(self.flush, 10)
 
@@ -101,16 +126,37 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.bot_token and self.chat_id)
 
+    @property
+    def trade_enabled(self) -> bool:
+        return bool(self.trade_bot_token and self.trade_chat_id)
+
+    @property
+    def system_enabled(self) -> bool:
+        return bool(self.system_bot_token and self.system_chat_id)
+
+    @staticmethod
+    def route(record: Dict[str, Any]) -> str:
+        """"trade"(交易快報)/ "system"(系統警報)/ "normal"(原本的專案 bot)。"""
+        extra = record["extra"]
+        if extra.get("category") in TRADE_CATEGORIES:
+            return "trade"
+        if record["level"].name in LEVEL_STYLES:
+            return "trade" if extra.get("trade") is True else "system"
+        return "normal"
+
     # ---------- 對外 ----------
 
-    def notify(self, text: str, parse_mode: Optional[str] = None) -> bool:
-        """直接發一則訊息(不經過 log;預設純文字)。不阻塞;回傳是否成功放進發送 queue。"""
-        if not self.enabled:
+    def notify(self, text: str, parse_mode: Optional[str] = None, route: str = "normal") -> bool:
+        """直接發一則訊息(不經過 log;預設純文字)。route = "trade" / "system" / "normal";
+        指定的 bot 沒設定就送原本的 bot。不阻塞;回傳是否成功放進發送 queue。"""
+        if (route == "trade" and not self.trade_enabled) or (route == "system" and not self.system_enabled):
+            route = "normal"
+        if route == "normal" and not self.enabled:
             return False
         if len(text) > MAX_MESSAGE_CHARS:
             text = text[: MAX_MESSAGE_CHARS - 20] + "\n…(訊息過長已截斷)"
         try:
-            self._queue.put_nowait((text, parse_mode))
+            self._queue.put_nowait((text, parse_mode, route))
             return True
         except queue.Full:
             self.dropped += 1
@@ -128,7 +174,7 @@ class TelegramNotifier:
                     return
                 if suppressed:
                     suffix = f"\n<i>(上次通知後,同一位置的訊息另外略過 {suppressed} 則)</i>"
-            self.notify(self.format(record) + suffix, parse_mode="HTML")
+            self.notify(self.format(record) + suffix, parse_mode="HTML", route=self.route(record))
         except Exception:  # noqa: BLE001  sink 出錯不能影響主程式
             pass
 
@@ -183,8 +229,8 @@ class TelegramNotifier:
 
     # ---------- 內部 ----------
 
-    def _api_url(self, method: str) -> str:
-        return f"https://api.telegram.org/bot{self.bot_token}/{method}"
+    def _api_url(self, method: str, token: Optional[str] = None) -> str:
+        return f"https://api.telegram.org/bot{token or self.bot_token}/{method}"
 
     def _throttled(self, record: Dict[str, Any]) -> Optional[int]:
         """None = 冷卻中,這則不發;數字 = 可以發,數字是冷卻期間略過了幾則。"""
@@ -202,20 +248,22 @@ class TelegramNotifier:
 
     def _worker(self) -> None:
         while True:
-            text, parse_mode = self._queue.get()
+            text, parse_mode, route = self._queue.get()
             try:
-                self._send(text, parse_mode)
+                self._send(text, parse_mode, route)
             finally:
                 self._queue.task_done()
 
-    def _send(self, text: str, parse_mode: Optional[str] = None) -> None:
+    def _send(self, text: str, parse_mode: Optional[str] = None, route: str = "normal") -> None:
         local = logger.bind(telegram=False)
+        token, chat = {"trade": (self.trade_bot_token, self.trade_chat_id),
+                       "system": (self.system_bot_token, self.system_chat_id)}.get(route, (self.bot_token, self.chat_id))
         for attempt in range(self.max_retries):
-            data = {"chat_id": self.chat_id, "text": text}
+            data = {"chat_id": chat, "text": text}
             if parse_mode:
                 data["parse_mode"] = parse_mode
             try:
-                resp = self.session.post(self._api_url("sendMessage"), data=data, timeout=self.timeout)
+                resp = self.session.post(self._api_url("sendMessage", token), data=data, timeout=self.timeout)
                 resp.raise_for_status()
                 self._update_connection_state(True)
                 return

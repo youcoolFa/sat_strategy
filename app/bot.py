@@ -66,7 +66,7 @@ def fee_ratio(gross, fees):
 
 
 def status_interval_minutes():
-    """每小時狀態回報(⚪ #狀態)的間隔:.env 的 STATUS_INTERVAL_MINUTES,預設 60,0 = 關閉。"""
+    """每小時狀態回報(⚫ #狀態)的間隔:.env 的 STATUS_INTERVAL_MINUTES,預設 60,0 = 關閉。"""
     raw = os.getenv("STATUS_INTERVAL_MINUTES")
     if not raw:
         return DEFAULT_STATUS_INTERVAL_MINUTES
@@ -337,7 +337,7 @@ class SatStrategyBot:
         entry_price = compute_entry_price(origin_price, self.config.entry_deviation_pct)
 
         # Telegram 事件:啟動/結束一律發;每一輪的成交只在實盤發(dry-run 每 5 秒就一輪,會洗版)
-        events = logger.bind(telegram=True)  # 類別:系統(🔵 #系統)
+        events = logger.bind(telegram=True)  # 類別:系統(⚪ #系統)
         trade_events = logger.bind(telegram=not self.config.dry_run, category="fill")  # 🟢 #成交
         qty = self.config.order_qty
         status_note = f"\n每 {self._status_interval:g} 分鐘回報一次狀態" if self._status_interval > 0 else ""
@@ -419,7 +419,7 @@ class SatStrategyBot:
             ticker_feed.stop()
         logger.info("sat_strategy bot 結束")
         reason = "收到停止訊號" if self._stop_requested else "窗口到期"
-        events.bind(category="pnl").info(  # 🟣 #損益
+        events.bind(category="pnl").info(  # 🔵 #損益
             f"🏁 sat_strategy 結束({reason})\n完成 {cycles} 輪{',收尾市價平倉 1 筆' if forced_line else ''},"
             f"淨利合計 {gross_total - fees_total:+.2f} USDT"
             f"(毛利 {gross_total:+.2f} − 手續費 {fees_total:.4f}){'(含估算)' if fees_estimated else ''}|"
@@ -440,7 +440,7 @@ class SatStrategyBot:
         return price * qty * MAKER_FEE_ESTIMATE, True
 
     def _maybe_report_status(self):
-        """時間到就發一則 ⚪ #狀態(心跳)。只有這時候才查一次現價;出錯只記本地 log,不影響交易。"""
+        """時間到就發一則 ⚫ #狀態(心跳)。只有這時候才查一次現價;出錯只記本地 log,不影響交易。"""
         if self._status is None or self._status_interval <= 0:
             return
         now = self._now_hkt()

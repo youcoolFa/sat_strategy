@@ -170,7 +170,7 @@ class TestSinkFormat:
         n = make(session)
         log_through(n, captured, lambda: logger.bind(telegram=True).info("已啟動"))
         [text] = session.sent
-        assert "🔵 #系統" in text and "已啟動" in text  # 沒指定類別的事件 = 系統
+        assert "⚪ #系統" in text and "已啟動" in text  # 沒指定類別的事件 = 系統
 
     def test_plain_info_is_not_sent(self, captured):
         session = FakeSession()
@@ -280,8 +280,8 @@ class TestCategoryStyles:
     """Telegram 文字不能上色:用「彩色圓點 + hashtag」區分類別。點 hashtag 可以篩出同類訊息。"""
 
     @pytest.mark.parametrize("category, expected", [
-        ("system", "🔵 #系統"), ("fill", "🟢 #成交"), ("pnl", "🟣 #損益"),
-        ("position", "🟠 #持倉"), ("equity", "🟤 #權益"), ("status", "⚪ #狀態"),
+        ("system", "⚪ #系統"), ("fill", "🟢 #成交"), ("pnl", "🔵 #損益"),
+        ("position", "🟠 #持倉"), ("equity", "🟣 #權益"), ("status", "⚫ #狀態"),
     ])
     def test_event_categories(self, captured, category, expected):
         session = FakeSession()
@@ -329,3 +329,120 @@ class TestCategoryStyles:
         n.notify("a<b")
         n.flush(timeout=5)
         assert session.sent == ["a<b"] and session.modes == [None]
+
+
+class RoutedSession(FakeSession):
+    """記下每則送到哪個 bot(token 在網址裡)、哪個 chat。"""
+
+    def __init__(self):
+        super().__init__()
+        self.routes = []
+
+    def post(self, url, data, timeout):
+        self.routes.append((url.split("/bot", 1)[1].split("/", 1)[0], data["chat_id"]))
+        return super().post(url, data, timeout)
+
+
+NORMAL, TRADE, SYSTEM = ("123:abc", "42"), ("777:trade", "71"), ("888:system", "81")
+
+
+def make_routed(session, trade=TRADE, system=SYSTEM, **kw):
+    return TelegramNotifier(project="sat_strategy", bot_token=NORMAL[0], chat_id=NORMAL[1],
+                            trade_bot_token=trade[0], trade_chat_id=trade[1],
+                            system_bot_token=system[0], system_chat_id=system[1],
+                            session=session, clock=Clock(), retry_base_seconds=0, **kw)
+
+
+class TestRouting:
+    """2026-10-11 使用者要求:兩個有聲音的 bot(四個專案共用)+ 原本的專案 bot(靜音)。
+    - 交易快報:🟢 成交、🟣 權益(資產大變動)、確定的成交失敗(logger.bind(trade=True).error(...))
+    - 系統警報:其他所有 🟡 警告 / 🔴 錯誤 / 🆘 嚴重(網路重試中、資料庫、當掉…)
+    - 原本的 bot:⚪ 系統、🔵 損益、🟠 持倉、⚫ 狀態
+    沒設定的 bot → 改送原本的 bot,不會漏。"""
+
+    @pytest.mark.parametrize("emit", [
+        lambda: logger.bind(telegram=True, category="fill").info("✅ 成交|平倉 Sell 20 @ 1.2322"),
+        lambda: logger.bind(telegram=True, category="equity").info("⬇️ 權益 60.00 → 56.90(-5.17%)"),
+        lambda: logger.bind(trade=True).error("下單失敗:重試用完"),
+        lambda: logger.bind(trade=True).critical("收尾市價平倉失敗"),
+    ])
+    def test_trade_news_goes_to_the_trade_bot(self, captured, emit):
+        session = RoutedSession()
+        log_through(make_routed(session), captured, emit)
+        assert session.routes == [TRADE]
+
+    @pytest.mark.parametrize("emit", [
+        lambda: logger.warning("Bybit 網路錯誤,第 1 次重試"),
+        lambda: logger.error("寫入交易資料庫失敗"),
+        lambda: logger.critical("程式當掉"),
+    ])
+    def test_other_problems_go_to_the_system_bot(self, captured, emit):
+        session = RoutedSession()
+        log_through(make_routed(session), captured, emit)
+        assert session.routes == [SYSTEM]
+
+    @pytest.mark.parametrize("category", [None, "system", "pnl", "position", "status"])
+    def test_routine_events_go_to_the_normal_bot(self, captured, category):
+        session = RoutedSession()
+        log_through(make_routed(session), captured, lambda: logger.bind(telegram=True, category=category).info("一般事件"))
+        assert session.routes == [NORMAL]
+
+    def test_unconfigured_bots_fall_back_to_the_normal_bot(self, captured):
+        session = RoutedSession()
+        n = make_routed(session, trade=("", ""), system=("", ""))
+        log_through(n, captured, lambda: logger.error("寫入交易資料庫失敗"))
+        log_through(n, captured, lambda: logger.bind(telegram=True, category="fill").info("成交"))
+        assert session.routes == [NORMAL, NORMAL]
+
+    def test_bots_are_read_from_env(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_TRADE_BOT_TOKEN", "777:trade")
+        monkeypatch.setenv("TELEGRAM_TRADE_CHAT_ID", "71")
+        monkeypatch.setenv("TELEGRAM_SYSTEM_BOT_TOKEN", "888:system")
+        monkeypatch.setenv("TELEGRAM_SYSTEM_CHAT_ID", "81")
+        n = TelegramNotifier(project="x", bot_token="1:a", chat_id="2", session=FakeSession(), start_worker=False)
+        assert n.trade_enabled and n.system_enabled
+
+    def test_new_bots_share_telegram_chat_id_when_they_have_none(self, monkeypatch):
+        """三個 bot 都私訊給使用者自己,chat id 是同一個(使用者的帳號):.env 只寫一個 TELEGRAM_CHAT_ID 就好;
+        要送到別的地方(例如群組)才另外寫 TELEGRAM_TRADE_CHAT_ID / TELEGRAM_SYSTEM_CHAT_ID。"""
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        monkeypatch.setenv("TELEGRAM_TRADE_BOT_TOKEN", "777:trade")
+        monkeypatch.setenv("TELEGRAM_SYSTEM_BOT_TOKEN", "888:system")
+        monkeypatch.delenv("TELEGRAM_TRADE_CHAT_ID", raising=False)
+        monkeypatch.delenv("TELEGRAM_SYSTEM_CHAT_ID", raising=False)
+        n = TelegramNotifier(project="x", bot_token="1:a", session=FakeSession(), start_worker=False)
+        assert n.trade_enabled and n.system_enabled
+        assert n.trade_chat_id == "42" and n.system_chat_id == "42"
+
+    def test_own_chat_id_wins(self, monkeypatch):
+        monkeypatch.setenv("TELEGRAM_CHAT_ID", "42")
+        monkeypatch.setenv("TELEGRAM_TRADE_CHAT_ID", "-100999")  # 例如群組
+        n = TelegramNotifier(project="x", bot_token="1:a", trade_bot_token="777:trade", session=FakeSession(),
+                             start_worker=False)
+        assert n.trade_chat_id == "-100999"
+
+    def test_title_still_names_the_project(self, captured):
+        session = RoutedSession()
+        log_through(make_routed(session), captured, lambda: logger.error("寫入交易資料庫失敗"))
+        assert "sat_strategy" in session.sent[0] and "#錯誤" in session.sent[0]
+
+
+class TestColours:
+    """2026-10-11 使用者指定:⚪ 系統、🟢 成交、🔵 損益、🟠 持倉、🟣 權益、⚫ 狀態(等級:🟡 警告、🔴 錯誤、🆘 嚴重)。"""
+
+    @pytest.mark.parametrize("category, title", [
+        (None, "⚪ #系統"), ("system", "⚪ #系統"), ("fill", "🟢 #成交"), ("pnl", "🔵 #損益"),
+        ("position", "🟠 #持倉"), ("equity", "🟣 #權益"), ("status", "⚫ #狀態"),
+    ])
+    def test_category_colours(self, captured, category, title):
+        session = RoutedSession()
+        log_through(make_routed(session), captured, lambda: logger.bind(telegram=True, category=category).info("x"))
+        assert session.sent[0].startswith(f"<b>{title}")
+
+
+def test_tests_never_use_the_real_trade_or_system_bot():
+    """conftest 要把兩個新 bot 也清空:使用者把 TELEGRAM_TRADE_* / TELEGRAM_SYSTEM_* 加進 .env 後,測試不能真的發到手機。"""
+    import os
+
+    for key in ("TELEGRAM_TRADE_BOT_TOKEN", "TELEGRAM_TRADE_CHAT_ID", "TELEGRAM_SYSTEM_BOT_TOKEN", "TELEGRAM_SYSTEM_CHAT_ID"):
+        assert os.getenv(key, "") == "", key

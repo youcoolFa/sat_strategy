@@ -30,12 +30,20 @@ def _telegram_health_check_loop(stop_event: threading.Event) -> None:
         stop_event.wait(TELEGRAM_CHECK_INTERVAL_SECONDS)
 
 
-# 例外被吞掉時回傳 default=False,讓 process 用 exit code 1 結束——
+# 例外被吞掉時回傳 False,讓 process 用 exit code 1 結束——
 # sat_strategy_start.sh 的 launchd 監管迴圈靠非 0 exit code 判斷「崩潰,要重啟」。
-@logger.catch(level="CRITICAL", reraise=False, default=False)
+# 交易所拒絕(ccxt.ExchangeError:餘額不足、下單 / 平倉被拒)= 確定的成交失敗 → trade=True 送「交易快報」;
+# 其他(網路持續失敗、程式 bug…)→ 系統警報(2026-10-11)。
 def _run_bot(bot: SatStrategyBot) -> bool:
-    bot.run()
-    return True
+    try:
+        bot.run()
+        return True
+    except Exception as e:  # noqa: BLE001
+        import ccxt
+
+        logger.bind(trade=isinstance(e, ccxt.ExchangeError)).opt(exception=e).critical(
+            f"sat_strategy 未預期的例外結束:{type(e).__name__}: {e}")
+        return False
 
 
 def run_with_monitoring() -> int:

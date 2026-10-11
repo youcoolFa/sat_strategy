@@ -184,7 +184,7 @@ def test_cleanup_before_window_end_leaves_nothing_behind(weekend):
 
 def test_telegram_start_fills_and_heartbeats(weekend):
     _, _, _, messages = weekend
-    [start] = by_tag(messages, "🔵 #系統")
+    [start] = by_tag(messages, "⚪ #系統")
     assert "🚀 sat_strategy 啟動(實盤)" in start and "origin 80000.00 → 買入 79400.00(−0.75%)× 0.01" in start
     assert "窗口結束 2026-10-12 06:00 HKT" in start
 
@@ -196,7 +196,7 @@ def test_telegram_start_fills_and_heartbeats(weekend):
     assert "第 1 輪完成" in closed and "淨利 +5.68 USDT(毛利 +6.00 − 手續費 0.3188)" in closed
     assert "估算" not in closed and "手續費佔利益 5.31%" in closed
 
-    beats = by_tag(messages, "⚪ #狀態")
+    beats = by_tag(messages, "⚫ #狀態")
     assert 48 <= len(beats) <= 50  # 週六 05:00 起每小時一則,到週一 05:55
     assert "狀態:掛買單等待成交 @ 79400.00" in beats[0]
     assert any("狀態:持倉 0.01 @ 79400.00" in b and "未實現 -4.00" in b for b in beats)
@@ -208,14 +208,14 @@ def test_telegram_start_fills_and_heartbeats(weekend):
 
 def test_end_summary_is_sent(weekend):
     _, _, _, messages = weekend
-    [end] = by_tag(messages, "🟣 #損益")
+    [end] = by_tag(messages, "🔵 #損益")
     assert "🏁 sat_strategy 結束(窗口到期)" in end and "完成 1 輪" in end
 
 
 def test_end_summary_includes_the_forced_close(weekend):
     """2026-10-07 修正:結束總結以前只算完成的輪,收尾市價平倉的虧損和手續費都漏掉(報 +5.68,實際約 +1.09)。"""
     _, _, _, messages = weekend
-    [end] = by_tag(messages, "🟣 #損益")
+    [end] = by_tag(messages, "🔵 #損益")
     # 第 2 輪:買 79400、收尾市價 79000 → 毛利 −4.00;全部毛利 6.00 − 4.00 = +2.00
     # 手續費:第 1 輪 0.3188 + 第 2 輪買入 79400×0.01×0.02% = 0.1588 + 市價平倉 79000×0.01×0.055% = 0.4345 → 0.9121
     assert "完成 1 輪" in end and "收尾市價平倉 1 筆" in end
@@ -226,6 +226,6 @@ def test_end_summary_includes_the_forced_close(weekend):
 
 def test_forced_close_fee_is_estimated_when_exchange_has_none(monkeypatch):
     _, _, _, messages = run_weekend(monkeypatch, no_market_fee=True)
-    [end] = by_tag(messages, "🟣 #損益")
+    [end] = by_tag(messages, "🔵 #損益")
     # 查不到市價單手續費 → 用吃單費率估算(同樣 0.4345),並標註「含估算」
     assert "淨利合計 +1.09 USDT(毛利 +2.00 − 手續費 0.9121)(含估算)" in end
